@@ -345,15 +345,12 @@ bool GenSycl::ImpactTransform::transform_matrix()
     td0 += wstart-timer_transform ;
     SyclArray::array_xxf f_data = SyclArray::Zero<SyclArray::array_xxf>(end_pitch - start_pitch, m_end_tick - m_start_tick);;
     m_bd.get_charge_matrix_sycl(f_data, m_vec_impact, start_pitch, m_start_tick);
-//    std::cout << SyclArray::dump_2d_view(f_data, 10);
     double wend = omp_get_wtime();
     td1 += wend-wstart ;
     g_get_charge_vec_time += wend - wstart;
-    //log->debug("ImpactTransform::ImpactTransform() : get_charge_vec() Total running time : {}", g_get_charge_vec_time);
     log->debug("ImpactTransform::ImpactTransform() : get_charge_matrix() Total_Time :  {}", g_get_charge_vec_time);
 
     wstart = omp_get_wtime();
-    //SyclArray::array_xxc acc_data_f_w = SyclArray::Zero<SyclArray::array_xxc>(end_ch - start_ch + 2 * npad_wire, m_end_tick - m_start_tick);
     SyclArray::array_xxc acc_data_f_w(end_ch - start_ch + 2 * npad_wire, m_end_tick - m_start_tick);
     SyclArray::array_xxf acc_data_t_w = SyclArray::Zero<SyclArray::array_xxf>(end_ch - start_ch + 2 * npad_wire, m_end_tick - m_start_tick);
     log->info("yuhw: pitch   {} {} {} {}",start_pitch, end_pitch, f_data.extent(0), f_data.extent(1));
@@ -393,8 +390,6 @@ bool GenSycl::ImpactTransform::transform_matrix()
             auto ip = m_pir->closest(impact);
             Waveform::compseq_t sp_f = ip->spectrum();
 
-
-	    //memcpy((void*) &sps_h(0, jimp) , (void*) &sp_f[0] , sp_size*2*sizeof(float) ) ; 
 	    memcpy((void*) &sps_h[jimp * sp_size] , (void*) &sp_f[0] , sp_size*sizeof(std::complex<float>) ) ; 
            
             // 0 and right on the left; left on the right
@@ -432,35 +427,42 @@ bool GenSycl::ImpactTransform::transform_matrix()
         auto data_d = SyclArray::dft_rc(f_data, 0);
 	auto data_d_ptr = data_d.data() ;
 	f_data.free()  ;
+	q.wait();
 	SyclArray::array_xxc data_c(data_d.extent(0), data_d.extent(1) ) ;
+
+
         SyclArray::dft_cc(data_d, data_c,  1);
 	auto data_c_ptr = data_c.data() ;
 
+	q.wait();
         SyclArray::dft_cc(resp_f_w_k, data_d, 1);
 	resp_f_w_k.free() ;
 
-        // S(f) * R(f)
-	q.parallel_for( {data_c.extent(0), data_c.extent(1)} , [=] (auto item ) {
-		auto i0 = item.get_id(0) ;
-		auto i1 = item.get_id(1) ;
-		auto d0 = item.get_range(0) ; 
-	        float a = data_c_ptr[i0 + i1*d0].x * data_d_ptr[i0 +  i1*d0].x - data_c_ptr[i0 + i1*d0].y * data_d_ptr[i0 +  i1*d0].y ;
-	        float b = data_c_ptr[i0 + i1*d0].x * data_d_ptr[i0 +  i1*d0].y + data_c_ptr[i0 + i1*d0].y * data_d_ptr[i0 +  i1*d0].x ;
-	        data_c_ptr[i0 + i1*d0].x = a ; 
-	        data_c_ptr[i0 + i1*d0].y = b ; 
+
+	// S(f) * R(f)
+	q.parallel_for( data_c.extent(0)*data_c.extent(1) , [=] (auto i0 ) {
+	        float a = data_c_ptr[i0].x * data_d_ptr[i0].x - data_c_ptr[i0].y * data_d_ptr[i0].y ;
+	        float b = data_c_ptr[i0].x * data_d_ptr[i0].y + data_c_ptr[i0].y * data_d_ptr[i0].x ;
+	        data_c_ptr[i0].x = a ; 
+	        data_c_ptr[i0].y = b ; 
             }).wait();
 
 	SyclArray::idft_cc(data_c,data_d, 1);
 	data_c.free()  ;
 
+//	std::cout<<"Size: data_d: " << data_d.extent(0)<<","<< data_d.extent(1)<<" ; acc_data_f_w: "<< acc_data_f_w.extent(0) <<";" << acc_data_f_w.extent(1) <<std::endl ;
+//	std::cout<<"Size: data_c: " << data_c.extent(0)<<","<< data_c.extent(1)<<" ; acc_data_t_w: "<< acc_data_t_w.extent(0) <<";" << acc_data_t_w.extent(1) <<std::endl ;
         // extract M(channel) from M(impact)
+
+
 	auto acc_data_f_w_ptr = acc_data_f_w.data() ;
 	auto d0_acc = data_d.extent(0) ;
 	q.parallel_for( {acc_data_f_w.extent(0), acc_data_f_w.extent(1)} , [=] (auto item ) {
 		auto i0 = item.get_id(0) ;
 		auto i1 = item.get_id(1) ;
 		auto d0 = item.get_range(0) ; 
-                acc_data_f_w_ptr[i0 + i1 * d0 ] = data_d_ptr[(i0 + 1) * 10 + i1 * d0_acc ];
+               // acc_data_f_w_ptr[i0 + i1 * d0 ] = data_d_ptr[(i0 + 1) * 10 + i1 * d0_acc ];
+                acc_data_f_w_ptr[i0 + i1 * d0 ] = data_d_ptr[(i0 ) * 10 + i1 * d0_acc ];
             }).wait();
 	free(idx_h) ;
 	free(sps_h) ;
@@ -472,6 +474,7 @@ bool GenSycl::ImpactTransform::transform_matrix()
 
       SyclArray::array_xxf decon_data_v(acc_data_f_w.extent(0),acc_data_f_w.extent(1), false) ;    
       SyclArray::idft_cr(acc_data_f_w, acc_data_t_w, 0); 
+
     m_decon_data_v = acc_data_t_w ;
 
      auto acc_data_t_w_h = m_decon_data_v.to_host();
@@ -479,7 +482,7 @@ bool GenSycl::ImpactTransform::transform_matrix()
     //std::cout << "mdeconn_data_dv: (75,1) " << acc_data_t_w_h(75,1) <<std::endl ;
     Eigen::Map<Eigen::ArrayXXf> acc_data_t_w_eigen((float*) acc_data_t_w_h, acc_data_t_w.extent(0), acc_data_t_w.extent(1));
     m_decon_data = acc_data_t_w_eigen; // FIXME: reduce this copy
-    std::cout << "mdeconn_data: row, colum" << m_decon_data.rows()<<","<<m_decon_data.cols() <<std::endl ;
+    std::cout << "mdeconn_data: row, colum " << m_decon_data.rows()<<","<<m_decon_data.cols() <<std::endl ;
     
     double timer_fft = omp_get_wtime() - wstart;
     g_fft_time += timer_fft ;
