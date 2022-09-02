@@ -9,22 +9,36 @@
 #include <typeinfo>
 
 #include "WireCellGenSycl/SyclEnv.h"
-#include "oneapi/mkl/rng.hpp" 
+//#include "oneapi/mkl/rng.hpp" 
 
-#define MAX_PATCH_SIZE 512 
-#define P_BLOCK_SIZE  512
-#define MAX_PATCHES  50000
-#define MAX_NPSS_DEVICE 1000
-#define MAX_NTSS_DEVICE 1000
-#define FULL_MASK 0xffffffff
-#define RANDOM_BLOCK_SIZE (1024*1024)
-#define RANDOM_BLOCK_NUM 512
+
+//This part if need for OMP_RNG
+#if defined SYCL_TARGET_CUDA
+#define ARCH_CUDA
+#elif defined SYCL_TARGET_HIP
+#define ARCH_HIP
+#else 
+#define USE_RANDOM123
+#endif
+
+
+
+#include "openmp_rng.h" 
+
+//#define MAX_PATCH_SIZE 512 
+//#define P_BLOCK_SIZE  512
+//#define MAX_PATCHES  50000
+//#define MAX_NPSS_DEVICE 1000
+//#define MAX_NTSS_DEVICE 1000
+//#define FULL_MASK 0xffffffff
+//#define RANDOM_BLOCK_SIZE (1024*1024)
+//#define RANDOM_BLOCK_NUM 512
 //#define MAX_RANDOM_LENGTH (RANDOM_BLOCK_NUM*RANDOM_BLOCK_SIZE)
-#define MAX_RANDOM_LENGTH (MAX_PATCH_SIZE*MAX_PATCHES)
+//#define MAX_RANDOM_LENGTH (MAX_PATCH_SIZE*MAX_PATCHES)
 #define PI 3.14159265358979323846
 
-#define MAX_P_SIZE 50 
-#define MAX_T_SIZE 50 
+#define MAX_P_SIZE 100 
+#define MAX_T_SIZE 100 
 
 
 
@@ -184,6 +198,7 @@ void GenSycl::BinnedDiffusion_transform::get_charge_matrix_sycl(SyclArray::array
     db_vt tvecs_d(npatches * MAX_T_SIZE,false);
     db_vt qweights_d(npatches * MAX_P_SIZE,false);
     
+    
     t0 = omp_get_wtime() ;
     std::cout<<"SetSample: View creation:"<<t0-wstart <<std::endl ;
 
@@ -222,53 +237,63 @@ void GenSycl::BinnedDiffusion_transform::get_charge_matrix_sycl(SyclArray::array
         np_d_ptr[i] = npss;
         offsets_d_ptr[i] = t_ofb;
         offsets_d_ptr[npatches + i] = p_ofb;
-    });
+    }).wait();
+   
 
     t1 = omp_get_wtime() ;
     std::cout<<"SetSample: nt,np :"<<t1-t0 <<std::endl ;
     std::cout<<"npatches= "<<npatches <<std::endl ;
-    //  kernel calculate index for patch  Can be mergged to previous kernel ?
-    auto result =  sycl::malloc_shared<unsigned long > (1, q) ;  // total patches points
-    //temperary hold nt*np to scan, can we get rid of it ?
-    auto temp  =  sycl::malloc_device<unsigned long > (npatches+1, q) ;  
 
-    int wg_size = 256 ;
+    //temperary hold nt*np to scan, can we get rid of it ?
+    int wg_size = 128;
     int n_wg = (npatches + wg_size -1 )/wg_size ;
+    //auto temp  =  sycl::malloc_device<unsigned long > (n_wg*wg_size , q) ;  
+    auto temp  =  sycl::malloc_device<unsigned long > (npatches , q) ;  
+
+   /* q.parallel_for(sycl::nd_range<1>(n_wg*wg_size, wg_size), [=] (sycl::nd_item<1> item ) {
+ 			   int i = item.get_global_linear_id() ;
+			   temp[i] = (i< npatches ) ?  np_d_ptr[i] * nt_d_ptr[i] : 0  ;
+			   if(  i ==0 ) patch_idx_ptr[0]=0 ;
+			   }).wait();
+ */
+    q.submit( [&] ( sycl::handler &h ) {
+    h.parallel_for(npatches, [=] (auto i ) {
+		           temp[i] =  np_d_ptr[i] * nt_d_ptr[i] ;
+			   if(  i ==0 ) patch_idx_ptr[0]=0 ;
+			   })  ;
+    }) ;
+    q.wait()  ;
+
     q.parallel_for(sycl::nd_range<1>(n_wg*wg_size, wg_size), [=] (sycl::nd_item<1> item ) {
 			   auto wg = item.get_group() ;
- 			   auto i = item.get_global_linear_id() ;
-			   temp[i] = (i< npatches ) ?  np_d_ptr[i] * nt_d_ptr[i] : 0  ;
 			   auto p = joint_inclusive_scan(wg, &temp[0], &temp[npatches],&patch_idx_ptr[1], plus<>() )  ;
-			   if(i==0 ) result[0]= patch_idx_ptr[npatches] ;
-
                           }).wait();
+    unsigned long result ;
+    q.memcpy(&result, &patch_idx_ptr[npatches], sizeof(unsigned long) ) ;
+
+
     sycl::free(temp, q) ; 
 
     t0 = omp_get_wtime() ;
     std::cout<<"SetSample: scan :"<<t0-t1 <<std::endl ;
     // debug:
-    std::cout << "total patch size: " << result[0] << " WeightStrat: " << m_calcstrat << std::endl;
+    std::cout << "total patch size: " << result << " WeightStrat: " << m_calcstrat << std::endl;
     // Allocate space for patches on device
-    fl_vt patch_d(result[0], false);
+    fl_vt patch_d(result, false);
     auto patch_d_ptr = patch_d.data() ;
     // make a 1Darray pointing to random numbers
-    unsigned long size = result[0] ;
+    unsigned long size = result ;
+    wg_size = 32 ;
     if( size % 2 )  size++ ; 
+    n_wg = (size/2 + wg_size -1 )/wg_size ;
+    size = n_wg*wg_size*2 ;
     SyclArray::Array1D <double > normals(size, false) ; 
+    std::cout<<"rand number size: " << size << std::endl ; 
     auto normals_ptr = normals.data() ;
-    // temp space to hold uniform rn
-    auto temp_ur = sycl::malloc_device<double>(size, q) ;
     uint64_t seed = 2020;
-    oneapi::mkl::rng::philox4x32x10 engine(q, seed); 
-    //generate Uniform distribution 
-    oneapi::mkl::rng::uniform<double >  distr(0.0, 1.0);
-    oneapi::mkl::rng::generate(distr, engine, size, temp_ur); 
-    //box muller approx to normal distribution
-    q.parallel_for(size/2 , [=](auto i) { 
-        normals_ptr[2*i]     = sqrt(-2*sycl::log(temp_ur[i])) * sycl::cos(2*PI*temp_ur[i+1]);
-        normals_ptr[2*i + 1] = sqrt(-2*sycl::log(temp_ur[i])) * sycl::sin(2*PI*temp_ur[i+1]);	
-     } ) ;
-    sycl::free(temp_ur, q)  ;
+
+    generator_enum gen_type = generator_enum::philox;
+    omp_get_rng_normal_double(normals_ptr, size, 0.0f, 1.0f, seed, gen_type);
 
     t1 = omp_get_wtime() ;
     std::cout<<"SetSample: rand :"<<t1-t0 <<std::endl ;
@@ -282,7 +307,8 @@ void GenSycl::BinnedDiffusion_transform::get_charge_matrix_sycl(SyclArray::array
 
     q.submit([&] (sycl::handler& cgh ) {
       cgh.parallel_for_work_group( sycl::range(npatches), sycl::range(wg_size), [=] (sycl::group<1> g ) {
-      	int ip = g.get_group_id() ;
+      	//int ip = g.get_group_id() ;
+      	int ip = g.get_id() ;
       	const double sqrt2 = sqrt(2.0);
         int np = np_d_ptr[ip] ;
         int nt = nt_d_ptr[ip];
@@ -345,6 +371,7 @@ void GenSycl::BinnedDiffusion_transform::get_charge_matrix_sycl(SyclArray::array
 	}
         } ) ;
     });
+    q.wait() ;
 
     t0 = omp_get_wtime() ;
     std::cout<<"SetSample: Pvec,Tvec,Weight :"<<t0-t1 <<std::endl ;
@@ -373,8 +400,9 @@ void GenSycl::BinnedDiffusion_transform::get_charge_matrix_sycl(SyclArray::array
     //std::cout<<"out d0 ="<<out_d0 <<std::endl ;
 
     q.submit ([&] ( sycl::handler & cgh ) {
-        cgh.parallel_for_work_group( sycl::range(npatches), sycl::range(wg_size) , [=] (auto g) {
-	    int ipatch = g.get_group_id()[0] ;
+        cgh.parallel_for_work_group( sycl::range(npatches), sycl::range(wg_size) , [=] (sycl::group<1> g) {
+	    //int ipatch = g.get_group_id()[0] ;
+	    int ipatch = g.get_id()[0] ;
             int np = np_d_ptr[ipatch];
             int nt = nt_d_ptr[ipatch];
             int p = offsets_d_ptr[npatches + ipatch]-start_pitch;
@@ -388,6 +416,7 @@ void GenSycl::BinnedDiffusion_transform::get_charge_matrix_sycl(SyclArray::array
 		int idx_p = p + ii%np ;
 		int idx_t = t + ii/np ;
 		size_t out_idx = idx_p + idx_t *out_d0  ;
+#if defined(SYCL_TARGET_HIP) || defined(SYCL_TARGET_CUDA) 
 		auto out_a1 = sycl::atomic_ref< float, 
 				sycl::memory_order::relaxed, 
 				sycl::memory_scope::device, 
@@ -396,7 +425,18 @@ void GenSycl::BinnedDiffusion_transform::get_charge_matrix_sycl(SyclArray::array
 				sycl::memory_order::relaxed, 
 				sycl::memory_scope::device, 
 				sycl::access::address_space::global_space> ( out_ptr[ out_idx + 1  ]);  
-	        out_a1.fetch_add((float)(charge*weight) ) ; 
+
+#else
+		auto out_a1 = sycl::ext::oneapi::atomic_ref< float, 
+				sycl::memory_order::relaxed, 
+				sycl::memory_scope::device, 
+				sycl::access::address_space::global_space> ( out_ptr[out_idx ]);  
+		auto out_a2 = sycl::ext::oneapi::atomic_ref< float, 
+				sycl::memory_order::relaxed, 
+				sycl::memory_scope::device, 
+				sycl::access::address_space::global_space> ( out_ptr[ out_idx + 1  ]);  
+#endif
+		out_a1.fetch_add((float)(charge*weight) ) ; 
 	        out_a2.fetch_add((float)(charge*(1. - weight) ) ) ; 
 
 			    } ) ;
@@ -404,14 +444,8 @@ void GenSycl::BinnedDiffusion_transform::get_charge_matrix_sycl(SyclArray::array
 	}) ;	
      } );
 
-   
-    //auto out_h=out.to_host() ;
-    //for (int ii=0 ; ii<out.extent(1) ; ii++) 
-	 //   for (int jj=0 ; jj < out.extent(0) ; jj ++ ) 
-	//	    std::cout<<"Atomic_out: " << jj<<"x"<<ii<<" = "<<out_h[jj+ ii*out_d0]<<std::endl ; 
-    //free(out_h) ;
+    q.wait();
 
-   
 
     wend = omp_get_wtime();
     //free the memory
@@ -442,7 +476,7 @@ void GenSycl::BinnedDiffusion_transform::get_charge_matrix_sycl(SyclArray::array
     cout << "set_sampling(): part1 time :: " << g_set_sampling_part1
          << ", part2 time : " << g_set_sampling_part2 << ", part3 time : " << g_set_sampling_part3 << endl;
 }
-
+/*
 void GenSycl::BinnedDiffusion_transform::get_charge_matrix(std::vector<Eigen::SparseMatrix<float>* >& vec_spmatrix, std::vector<int>& vec_impact){
   const auto ib = m_pimpos.impact_binning();
 
@@ -537,6 +571,7 @@ void GenSycl::BinnedDiffusion_transform::get_charge_matrix(std::vector<Eigen::Sp
   
 }
 
+*/
 
 // a new function to generate the result for the entire frame ... 
 void GenSycl::BinnedDiffusion_transform::get_charge_vec(std::vector<std::vector<std::tuple<int,int, double> > >& vec_vec_charge, std::vector<int>& vec_impact){
@@ -695,18 +730,27 @@ void GenSycl::BinnedDiffusion_transform::get_charge_vec(std::vector<std::vector<
     SyclArray::Array1D <double > normals(size, false) ; 
     auto normals_ptr = normals.data() ;
     // temp space to hold uniform rn
-    auto temp_ur = sycl::malloc_device<double>(size, q) ;
+    //auto temp_ur = sycl::malloc_device<double>(size, q) ;
     uint64_t seed = 2020;
-    oneapi::mkl::rng::philox4x32x10 engine(q, seed); 
+//#if defined(SYCL_TARGET_CUDA) || defined(SYCL_TARGET_HIP) 
+//#warning: SYCL_TARGET_CUDA || SYCL_TARGET_HIP
+    generator_enum gen_type = generator_enum::philox;
+//#else
+//#warning: host-target
+//    generator_enum gen_type = generator_enum::mt19937 ;
+//#endif
+
+    omp_get_rng_normal_double(normals_ptr, size, 0.0f, 1.0f, seed, gen_type);
+    //oneapi::mkl::rng::philox4x32x10 engine(q, seed); 
     //generate Uniform distribution 
-    oneapi::mkl::rng::uniform<double >  distr(0.0, 1.0);
-    oneapi::mkl::rng::generate(distr, engine, size, temp_ur); 
-    //box muller approx to normal distribution
-    q.parallel_for(size/2 , [=](auto i) { 
-        normals_ptr[2*i]     = sqrt(-2*sycl::log(temp_ur[i])) * sycl::cos(2*PI*temp_ur[i+1]);
-        normals_ptr[2*i + 1] = sqrt(-2*sycl::log(temp_ur[i])) * sycl::sin(2*PI*temp_ur[i+1]);	
-     } ) ;
-    sycl::free(temp_ur, q)  ;
+   // oneapi::mkl::rng::uniform<double >  distr(0.0, 1.0);
+   // oneapi::mkl::rng::generate(distr, engine, size, temp_ur); 
+   // //box muller approx to normal distribution
+   // q.parallel_for(size/2 , [=](auto i) { 
+   //     normals_ptr[2*i]     = sqrt(-2*sycl::log(temp_ur[i])) * sycl::cos(2*PI*temp_ur[i+1]);
+   //     normals_ptr[2*i + 1] = sqrt(-2*sycl::log(temp_ur[i])) * sycl::sin(2*PI*temp_ur[i+1]);	
+    // } ) ;
+   // sycl::free(temp_ur, q)  ;
 
     // decide weight calculation
     int weightstrat = m_calcstrat;
@@ -720,7 +764,8 @@ void GenSycl::BinnedDiffusion_transform::get_charge_vec(std::vector<std::vector<
 
     q.submit([&] (sycl::handler& cgh ) {
       cgh.parallel_for_work_group( sycl::range(npatches), sycl::range(wg_size), [=] (sycl::group<1> g ) {
-      	int ip = g.get_group_id() ;
+      	//int ip = g.get_group_id() ;
+      	int ip = g.get_id() ;
       	const double sqrt2 = sqrt(2.0);
         int np = np_d_ptr[ip] ;
         int nt = nt_d_ptr[ip];
@@ -915,7 +960,7 @@ void GenSycl::BinnedDiffusion_transform::get_charge_vec(std::vector<std::vector<
     //     std::cout << "redimp: " << redimp << std::endl;
     //     auto v = vec_vec_charge[redimp];
     //     for (auto t : v) {
-    //         std::cout << get<0>(t) << ", " << get<1>(t) << ", " << get<2>(t) << "\n";
+    //        std::cout << get<0>(t) << ", " << get<1>(t) << ", " << get<2>(t) << "\n";
     //     }
     // }
   //wend = omp_get_wtime();
@@ -945,7 +990,7 @@ void GenSycl::BinnedDiffusion_transform::set_sampling_bat(const unsigned long np
 	        const gd_vt gdata ) {
 
   bool fl = false ;
-  //if( m_fluctuate) fl = true    ;
+  if( m_fluctuate) fl = true    ;
 
   auto q = GenSycl::SyclEnv::get_queue() ;
    
@@ -961,7 +1006,10 @@ void GenSycl::BinnedDiffusion_transform::set_sampling_bat(const unsigned long np
     auto patch_d_ptr = patch_d.data() ;
     auto normals_ptr = normals.data() ;
 
-  q.parallel_for(sycl::nd_range<1>(npatches*wg_size, wg_size)   , [=]( sycl::nd_item<1> item ) {
+
+    q.submit( [&] ( sycl::handler &h ) {
+//		    sycl::stream out(npatches*wg_size*2048,2048, h ) ;
+  h.parallel_for(sycl::nd_range<1>(npatches*wg_size, wg_size)   , [=]( sycl::nd_item<1> item ) {
       auto wg = item.get_group() ;
       int ip = item.get_group_linear_id()  ;
       int id  = item.get_local_id(0) ;
@@ -975,34 +1023,40 @@ void GenSycl::BinnedDiffusion_transform::set_sampling_bat(const unsigned long np
 
       double gsum = 0.0 ; 
       double lsum  = 0.0 ;
+      double charge=gdata_ptr[ip].charge ;
+      double charge_abs = abs(charge) ;
+
 
       for ( int it = 0 ; it < n_it  ; it ++ ) {
           int ii  = it * wg_size + id  ;
 	  double v =  ii < patch_size ?  pvecs_d_ptr[ip*MAX_P_SIZE+ ii%np]*tvecs_d_ptr[ip * MAX_T_SIZE + ii/np] : 0.0 ;
-	  lsum += v; 
-	  if( ii < patch_size) patch_d_ptr[ii + p0 ] = (float) v ;
+	  if( ii<patch_size) {
+		  lsum += v; 
+		  patch_d_ptr[ii + p0 ] = (float)v ;
+    	  }
       }
-     
       //group level sum 
       gsum = reduce_over_group(wg, lsum , plus<>());  
+      double r =charge/gsum ;
+     
 
-      double charge=gdata_ptr[ip].charge ;
-      double charge_abs = abs(charge) ;
       // normalize to total = charge ;
       for ( int it = 0 ; it < n_it  ; it ++ ) {
           int ii  = it * wg_size + id  ;
-	  if (ii < patch_size ) patch_d_ptr[ii+p0] *= float(charge/gsum) ;   
+	  if (ii < patch_size ) {
+		  patch_d_ptr[ii + p0 ] *= (float)r ;
+	  	}	  
       }
-
       if( fl ) {
       	  int n=(int) charge_abs;
-	  gsum =0.0 ; 
+          gsum =0.0 ; 
           lsum =0.0 ;
 	  for ( int it = 0 ; it < n_it    ; it ++ ) {
 	      int ii  = it * wg_size + id  ;
 	      if( ii < patch_size ) { 
-	       double p =  patch_d_ptr[ii+p0]/charge ;
-	       double q = 1-p ;
+	       double p =  (double)patch_d_ptr[ii + p0 ]/charge ; //normalized to total 1
+	       //if( p <0 || p>1.0 ) out<<"sqrt-: "<<ip<<" "<<ii<<" "<<p0<<" "<<ii+p0<<" \n" ;
+	       double q = 1.0-p ;
 	       double mu = n*p ;
 	       double sigma = sycl::sqrt(p*q*n) ;
 	       p = normals_ptr[ii+p0]*sigma + mu ;
@@ -1011,6 +1065,7 @@ void GenSycl::BinnedDiffusion_transform::set_sampling_bat(const unsigned long np
 	      }
 	  }
       }
+      //normalize again to total charge after fluctuation
      gsum = reduce_over_group(wg, lsum , plus<>()); 
       if( fl ) {
 	  for ( int it = 0 ; it < n_it  ; it ++ ) {
@@ -1019,8 +1074,10 @@ void GenSycl::BinnedDiffusion_transform::set_sampling_bat(const unsigned long np
           }
       }
 
-  } ) ;
 
+  } ) ;
+    } ) ;
+    q.wait() ;
 }
 
 

@@ -14,19 +14,27 @@ set(BOOST_ROOT $ENV{BOOST_DIR} )
 #set(BOOST_LIBRARYDIR $ENV{BOOST_LIB})
 
 find_package(Boost REQUIRED COMPONENTS)
-include_directories(Boost_INCLUDE_DIRS})
+#include_directories(Boost_INCLUDE_DIRS})
 set(Boost_USE_MULTITHREADED ON)
 
-find_package(CUDA REQUIRED)
 
-string(APPEND CMAKE_CXX_FLAGS "-g -O3 -fopenmp -pedantic -Wall -fsycl -fsycl-targets=nvptx64-nvidia-cuda ")
+#string(APPEND CMAKE_CXX_FLAGS "-g -O3 -fopenmp -pedantic -Wall -fsycl -fsycl-targets=amdgcn-amd-amdhsa -Xsycl-target-backend --offload-arch=gfx906")
+string(APPEND CMAKE_CXX_FLAGS "-g -O3 -fopenmp -pedantic -Wall -fsycl $ENV{SYCL_CLANG_EXTRA_FLAGS}")
 string(APPEND CMAKE_SHARED_LINKER_FLAGS "-Wl,--no-undefined")
 
 add_library(WireCellGenSycl SHARED ${all_files})
+
+list(APPEND CMAKE_PREFIX_PATH /opt/rocm )
+#find_package(hip) 
+find_package(rocrand) 
+find_package(hipfft)
+
 target_include_directories(WireCellGenSycl
   PRIVATE
     ${PROJECT_SOURCE_DIR}/../inc
     $ENV{OMPRNG}
+    $ENV{HIP_DIR}/include
+    $ENV{HIPFFT_INC}
     $ENV{EIGEN_INC}
     $ENV{JSONCPP_INC}
     $ENV{JSONNET_INC}
@@ -34,9 +42,8 @@ target_include_directories(WireCellGenSycl
     $ENV{WIRECELL_INC}
 )
 set_target_properties(WireCellGenSycl
-	PROPERTIES COMPILE_OPTIONS "-DEIGEN_NO_CUDA;-DEIGEN_DONT_VECTORIZE;-DSYCL_TARGET_CUDA")
-
-target_link_directories(WireCellGenSycl PRIVATE  $ENV{JSONCPP_LIB} $ENV{WIRECELL_LIB} })
-target_link_libraries(WireCellGenSycl PRIVATE  jsoncpp WireCellIface WireCellUtil  Boost::headers ${CUDA_CUFFT_LIBRARIES} ${CUDA_curand_LIBRARY})
+	PROPERTIES COMPILE_OPTIONS "-DEIGEN_NO_CUDA;-DEIGEN_DONT_VECTORIZE;-DSYCL_TARGET_HIP")
+target_link_directories(WireCellGenSycl PRIVATE  $ENV{JSONCPP_LIB} $ENV{WIRECELL_LIB} $ENV{HIP_DIR}/lib )
+target_link_libraries(WireCellGenSycl PRIVATE  jsoncpp WireCellIface WireCellUtil Boost::headers roc::rocrand hip::hipfft amdhip64)
 
 add_subdirectory(test)
